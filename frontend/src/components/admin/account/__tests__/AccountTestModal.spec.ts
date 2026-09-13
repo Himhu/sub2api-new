@@ -2,15 +2,17 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import AccountTestModal from '../AccountTestModal.vue'
 
-const { getAvailableModels, copyToClipboard } = vi.hoisted(() => ({
+const { getAvailableModels, updateAccount, copyToClipboard } = vi.hoisted(() => ({
   getAvailableModels: vi.fn(),
+  updateAccount: vi.fn(),
   copyToClipboard: vi.fn()
 }))
 
 vi.mock('@/api/admin', () => ({
   adminAPI: {
     accounts: {
-      getAvailableModels
+      getAvailableModels,
+      update: updateAccount
     }
   }
 }))
@@ -97,6 +99,7 @@ describe('AccountTestModal', () => {
       { id: 'gemini-3.1-flash-image', display_name: 'Gemini 3.1 Flash Image' }
     ])
     copyToClipboard.mockReset()
+    updateAccount.mockReset()
     Object.defineProperty(globalThis, 'localStorage', {
       value: {
         getItem: vi.fn((key: string) => (key === 'auth_token' ? 'test-token' : null)),
@@ -136,7 +139,7 @@ describe('AccountTestModal', () => {
     await flushPromises()
     await flushPromises()
 
-    expect(global.fetch).toHaveBeenCalledTimes(1)
+    expect(global.fetch).toHaveBeenCalledTimes(3)
     const [, request] = (global.fetch as any).mock.calls[0]
     expect(JSON.parse(request.body)).toEqual({
       model_id: 'gemini-3.1-flash-image',
@@ -218,6 +221,40 @@ describe('AccountTestModal', () => {
       model_id: 'gpt-5.4',
       prompt: '',
       mode: 'compact'
+    })
+  })
+
+  it('默认测试全部模型，并允许删除配置中测试失败的模型', async () => {
+    getAvailableModels.mockResolvedValue([
+      { id: 'model-a', display_name: 'Model A' },
+      { id: 'model-b', display_name: 'Model B' }
+    ])
+    global.fetch = vi.fn().mockImplementation(() => Promise.resolve(createStreamResponse([
+      'data: {"type":"test_complete","success":false,"error":"unsupported"}\n'
+    ]))) as any
+    const account = {
+      id: 42,
+      name: 'API account',
+      platform: 'openai',
+      type: 'apikey',
+      status: 'active',
+      credentials: { model_mapping: { 'model-a': 'upstream-a', 'model-b': 'upstream-b' } }
+    }
+    updateAccount.mockImplementation(async (_id: number, updates: any) => ({ ...account, ...updates }))
+    const wrapper = mountModal(account)
+    await wrapper.setProps({ show: true })
+    await flushPromises()
+    await (wrapper.vm as any).startTest()
+    await flushPromises()
+
+    expect(global.fetch).toHaveBeenCalledTimes(2)
+    expect(wrapper.text()).toContain('admin.accounts.failedModels')
+    const removeButton = wrapper.findAll('button').find((button) => button.text().includes('admin.accounts.removeFailedModel'))
+    expect(removeButton).toBeTruthy()
+    await removeButton!.trigger('click')
+    await flushPromises()
+    expect(updateAccount).toHaveBeenCalledWith(42, {
+      credentials: { model_mapping: { 'model-b': 'upstream-b' } }
     })
   })
 })

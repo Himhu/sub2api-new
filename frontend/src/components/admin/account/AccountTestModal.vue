@@ -68,6 +68,13 @@
           label-key="display_name"
           :placeholder="loadingModels ? t('common.loading') + '...' : t('admin.accounts.selectTestModel')"
         />
+        <label
+          v-if="!isGrokAccount"
+          class="flex cursor-pointer items-center gap-2 text-xs text-gray-500 dark:text-gray-400"
+        >
+          <input v-model="testAllModels" type="checkbox" class="rounded border-gray-300 text-primary-600" :disabled="status === 'connecting'" />
+          {{ t('admin.accounts.testAllModels') }}
+        </label>
       </div>
 
       <div v-if="isOpenAIAccount" class="space-y-1.5">
@@ -222,6 +229,24 @@
         >
           <Icon name="link" size="sm" :stroke-width="2" />
         </button>
+      </div>
+
+      <div v-if="failedModels.length > 0" class="space-y-2 rounded-lg border border-red-200 bg-red-50 p-3 dark:border-red-900/60 dark:bg-red-950/20">
+        <div class="text-xs font-semibold text-red-700 dark:text-red-300">
+          {{ t('admin.accounts.failedModels') }}
+        </div>
+        <div v-for="model in failedModels" :key="model" class="flex items-center justify-between gap-2 text-sm text-red-700 dark:text-red-300">
+          <span class="truncate font-mono">{{ model }}</span>
+          <button
+            v-if="canRemoveModel(model)"
+            type="button"
+            class="shrink-0 rounded border border-red-300 px-2 py-1 text-xs hover:bg-red-100 disabled:opacity-50 dark:border-red-700 dark:hover:bg-red-900/40"
+            :disabled="removingModel === model"
+            @click="removeFailedModel(model)"
+          >
+            {{ removingModel === model ? t('common.loading') : t('admin.accounts.removeFailedModel') }}
+          </button>
+        </div>
       </div>
 
       <div v-if="generatedImages.length > 0" class="space-y-2">
@@ -397,6 +422,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'close'): void
+  (e: 'account-updated', account: Account): void
 }>()
 
 const terminalRef = ref<HTMLElement | null>(null)
@@ -406,6 +432,9 @@ const streamingContent = ref('')
 const errorMessage = ref('')
 const availableModels = ref<ClaudeModel[]>([])
 const selectedModelId = ref('')
+const testAllModels = ref(true)
+const failedModels = ref<string[]>([])
+const removingModel = ref('')
 const testPrompt = ref('')
 const loadingModels = ref(false)
 let abortController: AbortController | null = null
@@ -741,6 +770,8 @@ watch(
       testMode.value = 'default'
       grokTestMode.value = 'text'
       resetState()
+      testAllModels.value = true
+      failedModels.value = []
       await loadAvailableModels()
       if (isGrokAccount.value) {
         pickDefaultModelForMode()
@@ -799,6 +830,7 @@ const resetState = () => {
   generatedAudios.value = []
   generatedVideos.value = []
   previewImageUrl.value = ''
+  failedModels.value = []
 }
 
 const handleClose = () => {
@@ -825,62 +857,29 @@ const scrollToBottom = async () => {
   }
 }
 
-const startTest = async () => {
-  if (!props.account || !canStartTest.value) return
-
-  resetState()
-  status.value = 'connecting'
-  addLine(t('admin.accounts.startingTestForAccount', { name: props.account.name }), 'text-blue-400')
-  addLine(t('admin.accounts.testAccountTypeLabel', { type: props.account.type }), 'text-gray-400')
-  if (isGrokAccount.value) {
-    const modeLabel =
-      grokTestModeOptions.value.find((o) => o.value === grokTestMode.value)?.label || grokTestMode.value
-    addLine(t('admin.accounts.grok.selectedTestMode', { mode: modeLabel }), 'text-gray-400')
+const runSingleModelTest = async (modelId: string): Promise<boolean> => {
+  if (!props.account || !abortController) return false
+  streamingContent.value = ''
+  const requestBody: {
+    model_id: string
+    prompt: string
+    mode?: string
+    image_data_url?: string
+    audio_data_url?: string
+  } = {
+    model_id: showModelSelect.value ? modelId : '',
+    prompt: supportsPromptInput.value ? testPrompt.value.trim() : ''
   }
-  addLine('', 'text-gray-300')
-
-  abortStream()
-
-  abortController = new AbortController()
+  if (isOpenAIAccount.value) requestBody.mode = testMode.value
+  if (isGrokAccount.value) {
+    requestBody.mode = grokTestMode.value
+    if (['search', 'tts', 'stt', 'realtime'].includes(grokTestMode.value)) requestBody.model_id = ''
+    if (uploadImageDataURL.value && ['image', 'video'].includes(grokTestMode.value)) requestBody.image_data_url = uploadImageDataURL.value
+    if (uploadAudioDataURL.value && grokTestMode.value === 'stt') requestBody.audio_data_url = uploadAudioDataURL.value
+  }
 
   try {
-    const requestBody: {
-      model_id: string
-      prompt: string
-      mode?: string
-      image_data_url?: string
-      audio_data_url?: string
-    } = {
-      model_id: showModelSelect.value ? selectedModelId.value : '',
-      prompt: supportsPromptInput.value ? testPrompt.value.trim() : ''
-    }
-    if (isOpenAIAccount.value) {
-      requestBody.mode = testMode.value
-    }
-    if (isGrokAccount.value) {
-      // Always send explicit Grok mode. search/tts/stt/realtime are standalone
-      // endpoints (no free-form model select). text/image/video use optional model.
-      requestBody.mode = grokTestMode.value
-      if (
-        grokTestMode.value === 'search' ||
-        grokTestMode.value === 'tts' ||
-        grokTestMode.value === 'stt' ||
-        grokTestMode.value === 'realtime'
-      ) {
-        requestBody.model_id = ''
-      }
-      if (uploadImageDataURL.value && (grokTestMode.value === 'image' || grokTestMode.value === 'video')) {
-        requestBody.image_data_url = uploadImageDataURL.value
-      }
-      if (uploadAudioDataURL.value && grokTestMode.value === 'stt') {
-        requestBody.audio_data_url = uploadAudioDataURL.value
-      }
-    }
-
-    // Use the configured API base; EventSource does not support POST.
     const url = buildApiUrl(`/admin/accounts/${props.account.id}/test`)
-
-    // Use fetch with streaming for SSE since EventSource doesn't support POST
     const response = await fetch(url, {
       method: 'POST',
       headers: {
@@ -918,7 +917,7 @@ const startTest = async () => {
           if (jsonStr) {
             try {
               const event = JSON.parse(jsonStr)
-              handleEvent(event)
+              handleEvent(event, modelId)
             } catch (e) {
               console.error('Failed to parse SSE event:', e)
             }
@@ -926,15 +925,48 @@ const startTest = async () => {
         }
       }
     }
+    return true
+  } catch (error: unknown) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw error
+    }
+    const msg = error instanceof Error ? error.message : t('common.unknownError')
+    addLine(t('admin.accounts.errorPrefix', { message: msg }), 'text-red-400')
+    failedModels.value = [...new Set([...failedModels.value, modelId])]
+    return false
+  }
+}
+
+const startTest = async () => {
+  if (!props.account || !canStartTest.value) return
+  resetState()
+  status.value = 'connecting'
+  addLine(t('admin.accounts.startingTestForAccount', { name: props.account.name }), 'text-blue-400')
+  addLine(t('admin.accounts.testAccountTypeLabel', { type: props.account.type }), 'text-gray-400')
+  const models = !isGrokAccount.value && testAllModels.value
+    ? modelOptionsForMode.value.map((model) => model.id)
+    : [selectedModelId.value]
+  const modelsToTest = models.filter(Boolean)
+  abortStream()
+  abortController = new AbortController()
+  try {
+    for (const modelId of modelsToTest) {
+      addLine(t('admin.accounts.testingModel', { model: modelId }), 'text-cyan-400')
+      await runSingleModelTest(modelId)
+    }
+    if (failedModels.value.length > 0) {
+      status.value = 'error'
+      errorMessage.value = t('admin.accounts.someModelsFailed', { count: failedModels.value.length })
+    } else {
+      status.value = 'success'
+    }
   } catch (error: unknown) {
     if (error instanceof DOMException && error.name === 'AbortError') {
       status.value = 'idle'
       return
     }
     status.value = 'error'
-    const msg = error instanceof Error ? error.message : t('common.unknownError')
-    errorMessage.value = msg
-    addLine(t('admin.accounts.errorPrefix', { message: msg }), 'text-red-400')
+    errorMessage.value = error instanceof Error ? error.message : t('common.unknownError')
   }
 }
 
@@ -948,7 +980,7 @@ const handleEvent = (event: {
   audio_url?: string
   video_url?: string
   mime_type?: string
-}) => {
+}, modelId = '') => {
   switch (event.type) {
     case 'test_start':
       addLine(t('admin.accounts.connectedToApi'), 'text-green-400')
@@ -1029,21 +1061,62 @@ const handleEvent = (event: {
         streamingContent.value = ''
       }
       if (event.success) {
-        status.value = 'success'
+        if (!testAllModels.value || isGrokAccount.value) status.value = 'success'
       } else {
-        status.value = 'error'
-        errorMessage.value = event.error || t('admin.accounts.testFailed')
+        if (!failedModels.value.includes(modelId)) failedModels.value.push(modelId)
+        addLine(t('admin.accounts.modelTestFailed', { model: modelId, error: event.error || t('admin.accounts.testFailed') }), 'text-red-400')
+        if (!testAllModels.value || isGrokAccount.value) {
+          status.value = 'error'
+          errorMessage.value = event.error || t('admin.accounts.testFailed')
+        }
       }
       break
 
     case 'error':
-      status.value = 'error'
-      errorMessage.value = event.error || t('common.unknownError')
+      if (!failedModels.value.includes(modelId)) failedModels.value.push(modelId)
+      if (!testAllModels.value || isGrokAccount.value) {
+        status.value = 'error'
+        errorMessage.value = event.error || t('common.unknownError')
+      }
       if (streamingContent.value) {
         addLine(streamingContent.value, 'text-green-300')
         streamingContent.value = ''
       }
       break
+  }
+}
+
+const canRemoveModel = (model: string) => {
+  const credentials = props.account?.credentials as Record<string, unknown> | undefined
+  const mapping = credentials?.model_mapping
+  const whitelist = credentials?.model_whitelist
+  return Boolean(
+    (mapping && typeof mapping === 'object' && !Array.isArray(mapping) && Object.prototype.hasOwnProperty.call(mapping, model)) ||
+    (Array.isArray(whitelist) && whitelist.includes(model))
+  )
+}
+
+const removeFailedModel = async (model: string) => {
+  if (!props.account || !canRemoveModel(model)) return
+  const credentials = { ...(props.account.credentials || {}) } as Record<string, unknown>
+  if (credentials.model_mapping && typeof credentials.model_mapping === 'object' && !Array.isArray(credentials.model_mapping)) {
+    const mapping = { ...(credentials.model_mapping as Record<string, unknown>) }
+    delete mapping[model]
+    credentials.model_mapping = mapping
+  }
+  if (Array.isArray(credentials.model_whitelist)) {
+    credentials.model_whitelist = credentials.model_whitelist.filter((value) => value !== model)
+  }
+  removingModel.value = model
+  try {
+    const updated = await adminAPI.accounts.update(props.account.id, { credentials })
+    Object.assign(props.account, updated)
+    failedModels.value = failedModels.value.filter((value) => value !== model)
+    emit('account-updated', updated)
+  } catch (error) {
+    addLine(t('admin.accounts.removeFailedModelError', { model, error: error instanceof Error ? error.message : t('common.unknownError') }), 'text-red-400')
+  } finally {
+    removingModel.value = ''
   }
 }
 
