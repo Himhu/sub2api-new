@@ -1,4 +1,5 @@
 <div align="center">
+> 维护说明：本项目保留官方 `upstream/main`，二开功能和新服务器部署流程见 [独立维护与新服务器部署](docs/INDEPENDENT_FORK_CN.md)。
 
 <img src="assets/logo.svg" alt="Sub2API Logo" width="128" />
 
