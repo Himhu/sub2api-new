@@ -317,6 +317,7 @@ export default {
         peakRate: 'Peak: {start}-{end}, {value}x ({timezone})',
         noPeakRate: 'Peak rate: disabled',
         effectiveRate: 'Current rate: {value}x',
+        walletBalance: 'Upstream wallet balance: {value} {currency}',
         updatedAt: 'Updated: {value}',
         nextProbeAt: 'Next probe: {value}',
         lastDetectedRate: 'Last detected rate: {value}x',

@@ -14,20 +14,25 @@ import (
 const keyBillingInfoSchemaVersion = 1
 
 type keyBillingInfoResponse struct {
-	Object                  string    `json:"object"`
-	SchemaVersion           int       `json:"schema_version"`
-	BillingScope            string    `json:"billing_scope"`
-	GroupRateMultiplier     float64   `json:"group_rate_multiplier"`
-	UserRateMultiplier      *float64  `json:"user_rate_multiplier,omitempty"`
-	ResolvedRateMultiplier  float64   `json:"resolved_rate_multiplier"`
-	PeakRateEnabled         bool      `json:"peak_rate_enabled"`
-	PeakStart               *string   `json:"peak_start,omitempty"`
-	PeakEnd                 *string   `json:"peak_end,omitempty"`
-	PeakRateMultiplier      *float64  `json:"peak_rate_multiplier,omitempty"`
-	AppliedPeakMultiplier   *float64  `json:"applied_peak_multiplier,omitempty"`
-	EffectiveRateMultiplier float64   `json:"effective_rate_multiplier"`
-	Timezone                *string   `json:"timezone,omitempty"`
-	ObservedAt              time.Time `json:"observed_at"`
+	Object                  string   `json:"object"`
+	SchemaVersion           int      `json:"schema_version"`
+	BillingScope            string   `json:"billing_scope"`
+	GroupRateMultiplier     float64  `json:"group_rate_multiplier"`
+	UserRateMultiplier      *float64 `json:"user_rate_multiplier,omitempty"`
+	ResolvedRateMultiplier  float64  `json:"resolved_rate_multiplier"`
+	PeakRateEnabled         bool     `json:"peak_rate_enabled"`
+	PeakStart               *string  `json:"peak_start,omitempty"`
+	PeakEnd                 *string  `json:"peak_end,omitempty"`
+	PeakRateMultiplier      *float64 `json:"peak_rate_multiplier,omitempty"`
+	AppliedPeakMultiplier   *float64 `json:"applied_peak_multiplier,omitempty"`
+	EffectiveRateMultiplier float64  `json:"effective_rate_multiplier"`
+	// Balance is the wallet balance of the user who owns the authenticated key.
+	// It is included so an upstream Sub2API instance can safely synchronize the
+	// account's current wallet balance together with its billing multiplier.
+	Balance         *float64  `json:"balance,omitempty"`
+	BalanceCurrency string    `json:"balance_currency,omitempty"`
+	Timezone        *string   `json:"timezone,omitempty"`
+	ObservedAt      time.Time `json:"observed_at"`
 }
 
 // KeyBillingInfo returns the token billing multiplier effective for the authenticated API key.
@@ -95,6 +100,11 @@ func buildKeyBillingInfo(apiKey *service.APIKey, resolvedRate float64, now time.
 		PeakRateEnabled:         apiKey.Group.PeakRateEnabled,
 		EffectiveRateMultiplier: resolvedRate * appliedPeak,
 		ObservedAt:              now.UTC(),
+	}
+	if apiKey.User != nil {
+		balance := apiKey.User.Balance
+		response.Balance = &balance
+		response.BalanceCurrency = "USD"
 	}
 	if apiKey.Group.PeakRateEnabled {
 		response.PeakStart = &apiKey.Group.PeakStart

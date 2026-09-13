@@ -160,6 +160,23 @@ type upstreamBillingProbeHTTPStub struct {
 	beforeResponse func()
 }
 
+type upstreamBillingProbeUsageHTTPStub struct {
+	paths []string
+}
+
+func (u *upstreamBillingProbeUsageHTTPStub) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+	u.paths = append(u.paths, req.URL.Path)
+	body := `{"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token","group_rate_multiplier":0.8,"resolved_rate_multiplier":0.8,"peak_rate_enabled":false,"effective_rate_multiplier":0.8,"observed_at":"2026-07-13T01:00:00Z"}`
+	if req.URL.Path == "/v1/usage" {
+		body = `{"balance":78.48948921}`
+	}
+	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+}
+
+func (u *upstreamBillingProbeUsageHTTPStub) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	return u.Do(req, proxyURL, accountID, accountConcurrency)
+}
+
 func (u *upstreamBillingProbeHTTPStub) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
 	u.calls.Add(1)
 	active := u.active.Add(1)
@@ -223,7 +240,9 @@ func newUpstreamBillingProbeTestService(
 		AllowInsecureHTTP: true,
 	}}}
 	accountTestService := &AccountTestService{accountRepo: repo, httpUpstream: upstream, cfg: cfg}
-	return NewUpstreamBillingProbeService(repo, accountTestService, NewSettingService(settingRepo, cfg))
+	service := NewUpstreamBillingProbeService(repo, accountTestService, NewSettingService(settingRepo, cfg))
+	service.usageBalanceProbeEnabled = false
+	return service
 }
 
 func TestUpstreamBillingProbeSettingsDefaultsAndValidation(t *testing.T) {
@@ -338,6 +357,24 @@ func TestUpstreamBillingProbeSuccessPersistsSanitizedSnapshot(t *testing.T) {
 	persisted := decodeUpstreamBillingProbeSnapshot(account.Extra)
 	require.NotNil(t, persisted)
 	require.Equal(t, snapshot.Status, persisted.Status)
+}
+
+func TestUpstreamBillingProbeSupplementsBalanceFromUsage(t *testing.T) {
+	account := &Account{
+		ID: 18, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive,
+		Credentials: map[string]any{"api_key": "sk-test", "base_url": "https://upstream.example/v1"},
+		Extra:       map[string]any{UpstreamBillingProbeEnabledExtraKey: true},
+	}
+	repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{account.ID: account}}
+	upstream := &upstreamBillingProbeUsageHTTPStub{}
+	svc := newUpstreamBillingProbeTestService(repo, upstream, &upstreamBillingProbeSettingRepo{})
+	svc.usageBalanceProbeEnabled = true
+
+	snapshot, err := svc.ProbeAccount(context.Background(), account.ID)
+	require.NoError(t, err)
+	require.Equal(t, 78.48948921, snapshot.Data["balance"])
+	require.Equal(t, "USD", snapshot.Data["balance_currency"])
+	require.Equal(t, []string{"/v1/sub2api/billing", "/v1/usage"}, upstream.paths)
 }
 
 func TestUpstreamBillingProbeAdaptiveCNUsesChatProtocolBaseURL(t *testing.T) {
@@ -595,6 +632,58 @@ func TestUpstreamBillingProbeRejectsMissingRequiredMultiplier(t *testing.T) {
 	}`))
 
 	require.ErrorContains(t, err, "incomplete billing response")
+}
+
+func TestUpstreamBillingProbeParsesWalletBalance(t *testing.T) {
+	data, err := parseUpstreamBillingProbeResponse([]byte(`{
+		"object":"sub2api.key_billing",
+		"schema_version":1,
+		"billing_scope":"token",
+		"group_rate_multiplier":0.8,
+		"resolved_rate_multiplier":0.8,
+		"peak_rate_enabled":false,
+		"effective_rate_multiplier":0.8,
+		"balance":23.45,
+		"balance_currency":"USD",
+		"observed_at":"2026-07-13T01:00:00Z"
+	}`))
+
+	require.NoError(t, err)
+	require.Equal(t, 23.45, data["balance"])
+	require.Equal(t, "USD", data["balance_currency"])
+}
+
+func TestUpstreamBillingProbeRejectsInvalidWalletBalance(t *testing.T) {
+	_, err := parseUpstreamBillingProbeResponse([]byte(`{
+		"object":"sub2api.key_billing",
+		"schema_version":1,
+		"billing_scope":"token",
+		"group_rate_multiplier":0.8,
+		"resolved_rate_multiplier":0.8,
+		"peak_rate_enabled":false,
+		"effective_rate_multiplier":0.8,
+		"balance":-1,
+		"observed_at":"2026-07-13T01:00:00Z"
+	}`))
+
+	require.ErrorContains(t, err, "invalid wallet balance")
+}
+
+func TestParseUpstreamUsageBalance(t *testing.T) {
+	balance, currency := parseUpstreamUsageBalance([]byte(`{"balance":78.48948921}`))
+	require.NotNil(t, balance)
+	require.Equal(t, 78.48948921, *balance)
+	require.Equal(t, "USD", currency)
+
+	balance, currency = parseUpstreamUsageBalance([]byte(`{"balance":12.5,"balance_currency":"cny"}`))
+	require.NotNil(t, balance)
+	require.Equal(t, 12.5, *balance)
+	require.Equal(t, "CNY", currency)
+
+	for _, body := range []string{`{}`, `{"balance":-1}`, `{"balance":null}`, `{"balance":"12"}`} {
+		balance, _ := parseUpstreamUsageBalance([]byte(body))
+		require.Nil(t, balance, body)
+	}
 }
 
 func TestUpstreamBillingProbeDiscardsResultWhenIdentityChangesInFlight(t *testing.T) {

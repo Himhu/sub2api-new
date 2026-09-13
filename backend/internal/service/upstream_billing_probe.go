@@ -170,6 +170,8 @@ type upstreamBillingProbeResponse struct {
 	PeakRateMultiplier      *float64 `json:"peak_rate_multiplier"`
 	AppliedPeakMultiplier   *float64 `json:"applied_peak_multiplier"`
 	EffectiveRateMultiplier *float64 `json:"effective_rate_multiplier"`
+	Balance                 *float64 `json:"balance,omitempty"`
+	BalanceCurrency         *string  `json:"balance_currency,omitempty"`
 	Timezone                *string  `json:"timezone"`
 	ObservedAt              string   `json:"observed_at"`
 }
@@ -255,6 +257,8 @@ type UpstreamBillingProbeService struct {
 	lockCache    LeaderLockCache
 	db           *sql.DB
 	instanceID   string
+	// usageBalanceProbeEnabled enables the optional /v1/usage wallet lookup.
+	usageBalanceProbeEnabled bool
 }
 
 type upstreamBillingProbeSnapshotWriter interface {
@@ -272,14 +276,15 @@ func NewUpstreamBillingProbeService(
 ) *UpstreamBillingProbeService {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &UpstreamBillingProbeService{
-		accountRepo:        accountRepo,
-		accountTestService: accountTestService,
-		settingService:     settingService,
-		parentCtx:          ctx,
-		parentCancel:       cancel,
-		probeSlots:         make(chan struct{}, upstreamBillingProbeConcurrency),
-		now:                time.Now,
-		instanceID:         uuid.NewString(),
+		accountRepo:              accountRepo,
+		accountTestService:       accountTestService,
+		settingService:           settingService,
+		parentCtx:                ctx,
+		parentCancel:             cancel,
+		probeSlots:               make(chan struct{}, upstreamBillingProbeConcurrency),
+		now:                      time.Now,
+		instanceID:               uuid.NewString(),
+		usageBalanceProbeEnabled: true,
 	}
 }
 
@@ -701,6 +706,16 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 	if err != nil {
 		return s.persistProbeFailure(ctx, account, intervalMinutes, now, resp.StatusCode, "invalid_response", retryAfter(resp.Header, now))
 	}
+	if s.usageBalanceProbeEnabled {
+		if _, hasBalance := data["balance"]; !hasBalance {
+			if balance, currency := s.probeUpstreamUsageBalance(ctx, account, apiKey, normalizedBaseURL, proxyURL, profile, tlsProfile); balance != nil {
+				data["balance"] = *balance
+				if currency != "" {
+					data["balance_currency"] = currency
+				}
+			}
+		}
+	}
 	snapshot := &UpstreamBillingProbeSnapshot{
 		Status:        UpstreamBillingProbeStatusOK,
 		Data:          data,
@@ -744,6 +759,60 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 		)
 	}
 	return snapshot, nil
+}
+
+// probeUpstreamUsageBalance reads the optional wallet balance exposed by the
+// standard usage endpoint. A failure is ignored because rate data from the
+// billing endpoint remains valid for older upstreams.
+func (s *UpstreamBillingProbeService) probeUpstreamUsageBalance(
+	ctx context.Context,
+	account *Account,
+	apiKey, normalizedBaseURL, proxyURL string,
+	profile HTTPUpstreamProfile,
+	tlsProfile *tlsfingerprint.Profile,
+) (*float64, string) {
+	probeCtx, cancel := context.WithTimeout(ctx, upstreamBillingProbeRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, buildOpenAIEndpointURL(normalizedBaseURL, "/v1/usage"), nil)
+	if err != nil {
+		return nil, ""
+	}
+	reqCtx := WithHTTPUpstreamProfile(req.Context(), profile)
+	req = req.WithContext(WithHTTPUpstreamRedirectsDisabled(reqCtx))
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	account.ApplyHeaderOverrides(req.Header)
+	resp, err := s.accountTestService.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, tlsProfile)
+	if err != nil || resp == nil || resp.Body == nil {
+		return nil, ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, ""
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, upstreamBillingProbeMaxBodyBytes+1))
+	if err != nil || len(body) > upstreamBillingProbeMaxBodyBytes {
+		return nil, ""
+	}
+	return parseUpstreamUsageBalance(body)
+}
+
+func parseUpstreamUsageBalance(body []byte) (*float64, string) {
+	var response struct {
+		Balance         *float64 `json:"balance"`
+		BalanceCurrency *string  `json:"balance_currency"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil || response.Balance == nil {
+		return nil, ""
+	}
+	if *response.Balance < 0 || math.IsNaN(*response.Balance) || math.IsInf(*response.Balance, 0) {
+		return nil, ""
+	}
+	currency := "USD"
+	if response.BalanceCurrency != nil && strings.TrimSpace(*response.BalanceCurrency) != "" {
+		currency = strings.ToUpper(strings.TrimSpace(*response.BalanceCurrency))
+	}
+	return response.Balance, currency
 }
 
 func (s *UpstreamBillingProbeService) persistProbeFailure(
@@ -825,6 +894,9 @@ func parseUpstreamBillingProbeResponse(body []byte) (map[string]any, error) {
 	if response.UserRateMultiplier != nil && (*response.UserRateMultiplier < 0 || math.IsNaN(*response.UserRateMultiplier) || math.IsInf(*response.UserRateMultiplier, 0)) {
 		return nil, fmt.Errorf("invalid user billing multiplier")
 	}
+	if response.Balance != nil && (*response.Balance < 0 || math.IsNaN(*response.Balance) || math.IsInf(*response.Balance, 0)) {
+		return nil, fmt.Errorf("invalid wallet balance")
+	}
 	expectedResolved := *response.GroupRateMultiplier
 	if response.UserRateMultiplier != nil {
 		expectedResolved = *response.UserRateMultiplier
@@ -848,6 +920,14 @@ func parseUpstreamBillingProbeResponse(body []byte) (map[string]any, error) {
 	}
 	if response.UserRateMultiplier != nil {
 		data["user_rate_multiplier"] = *response.UserRateMultiplier
+	}
+	if response.Balance != nil {
+		data["balance"] = *response.Balance
+		currency := "USD"
+		if response.BalanceCurrency != nil && strings.TrimSpace(*response.BalanceCurrency) != "" {
+			currency = strings.ToUpper(strings.TrimSpace(*response.BalanceCurrency))
+		}
+		data["balance_currency"] = currency
 	}
 	if *response.PeakRateEnabled {
 		if response.PeakStart == nil || response.PeakEnd == nil || response.Timezone == nil ||

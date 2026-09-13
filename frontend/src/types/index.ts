@@ -1061,6 +1061,9 @@ export interface UpstreamBillingData {
   peak_rate_multiplier?: number
   applied_peak_multiplier?: number
   effective_rate_multiplier: number
+  /** Upstream Sub2API wallet balance, usually denominated in USD. */
+  balance?: number
+  balance_currency?: string
   timezone?: string
   observed_at: string
 }

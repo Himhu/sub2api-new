@@ -54,6 +54,8 @@ const billingData = {
   peak_rate_multiplier: 1.5,
   applied_peak_multiplier: 1.5,
   effective_rate_multiplier: 0.9,
+  balance: 23.45,
+  balance_currency: 'USD',
   timezone: 'Asia/Shanghai',
   observed_at: '2026-07-13T00:00:00Z'
 }
@@ -88,11 +90,11 @@ describe('UpstreamBillingRateCell', () => {
       }
     })
 
-    expect(wrapper.text()).toContain('0.60x')
+    expect(wrapper.text()).toContain('0.60x/23.45 USD')
     await wrapper.setProps({ now: Date.parse('2026-07-13T01:00:00Z') })
-    expect(wrapper.text()).toContain('0.90x')
+    expect(wrapper.text()).toContain('0.90x/23.45 USD')
     await wrapper.setProps({ now: Date.parse('2026-07-13T10:00:00Z') })
-    expect(wrapper.text()).toContain('0.60x')
+    expect(wrapper.text()).toContain('0.60x/23.45 USD')
     expect(wrapper.text()).not.toContain('admin.accounts.upstreamBilling.latest')
     expect(wrapper.get('[data-testid="upstream-billing-probe"]').text()).toBe('')
     expect(wrapper.get('[data-testid="upstream-billing-probe"]').attributes('aria-label')).toBe(
@@ -312,7 +314,7 @@ describe('UpstreamBillingRateCell', () => {
     await wrapper.setProps({ account: malformedAccount({}, { received_at: 'not-a-time' }) })
     expect(wrapper.get('[data-testid="upstream-billing-rate"]').text()).toBe('admin.accounts.upstreamBilling.stale')
     await wrapper.setProps({ account: malformedAccount({}, { received_at: '2026-07-13T00:31:00Z' }) })
-    expect(wrapper.get('[data-testid="upstream-billing-rate"]').text()).toBe('0.60x')
+    expect(wrapper.get('[data-testid="upstream-billing-rate"]').text()).toBe('0.60x/23.45 USD')
     await wrapper.setProps({ account: malformedAccount({}, { received_at: '2026-07-13T00:36:00Z' }) })
     expect(wrapper.get('[data-testid="upstream-billing-rate"]').text()).toBe('admin.accounts.upstreamBilling.stale')
     await wrapper.setProps({ account: malformedAccount({}, { fresh_until: '2026-07-12T23:59:00Z' }) })

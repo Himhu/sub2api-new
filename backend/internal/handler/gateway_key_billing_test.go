@@ -135,6 +135,26 @@ func TestGatewayHandlerKeyBillingInfoUsesUserOverride(t *testing.T) {
 	require.Equal(t, 0.5, got.EffectiveRateMultiplier)
 }
 
+func TestGatewayHandlerKeyBillingInfoIncludesWalletBalance(t *testing.T) {
+	groupID := int64(7)
+	apiKey := &service.APIKey{
+		UserID:  11,
+		GroupID: &groupID,
+		User:    &service.User{ID: 11, Balance: 23.45},
+		Group:   &service.Group{ID: groupID, RateMultiplier: 0.75},
+	}
+	c, w := newKeyBillingContext(apiKey)
+
+	newKeyBillingHandler(nil).KeyBillingInfo(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var got keyBillingInfoResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	require.NotNil(t, got.Balance)
+	require.Equal(t, 23.45, *got.Balance)
+	require.Equal(t, "USD", got.BalanceCurrency)
+}
+
 func TestBuildKeyBillingInfoAppliesPeakMultiplier(t *testing.T) {
 	groupID := int64(7)
 	apiKey := &service.APIKey{

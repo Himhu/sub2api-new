@@ -193,6 +193,7 @@ export default {
         peakRate: '高峰：{start}-{end}，{value}x（{timezone}）',
         noPeakRate: '高峰倍率：未启用',
         effectiveRate: '当前倍率：{value}x',
+        walletBalance: '上游用户余额：{value} {currency}',
         updatedAt: '更新时间：{value}',
         nextProbeAt: '下一次探测：{value}',
         lastDetectedRate: '上次探测倍率：{value}x',

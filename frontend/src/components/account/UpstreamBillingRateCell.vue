@@ -29,6 +29,12 @@
             }}
           </p>
           <p>{{ t('admin.accounts.upstreamBilling.effectiveRate', { value: currentEffectiveRate ?? '-' }) }}</p>
+          <p v-if="typeof data.balance === 'number' && Number.isFinite(data.balance)" data-testid="upstream-billing-balance">
+            {{ t('admin.accounts.upstreamBilling.walletBalance', {
+              value: data.balance.toFixed(2),
+              currency: data.balance_currency || 'USD'
+            }) }}
+          </p>
           <p>{{ t('admin.accounts.upstreamBilling.updatedAt', { value: formatDate(snapshot?.received_at) }) }}</p>
         </template>
         <template v-else-if="stale && lastDetectedRate != null">
@@ -209,7 +215,15 @@ const statusClass = computed(() => {
   return ''
 })
 const hasEffectiveRate = computed(() => effectiveRate.value !== '-')
-const primaryValue = computed(() => hasEffectiveRate.value ? effectiveRate.value : statusLabel.value || '-')
+const primaryValue = computed(() => {
+  if (!hasEffectiveRate.value) return statusLabel.value || '-'
+  const balance = data.value?.balance
+  if (typeof balance !== 'number' || !Number.isFinite(balance) || balance < 0) return effectiveRate.value
+  const currency = typeof data.value?.balance_currency === 'string' && data.value.balance_currency.trim()
+    ? data.value.balance_currency.trim().toUpperCase()
+    : 'USD'
+  return `${effectiveRate.value}/${balance.toFixed(2)} ${currency}`
+})
 const formatDate = (value?: string) => value
   ? new Date(value).toLocaleString(undefined, {
       month: '2-digit',
