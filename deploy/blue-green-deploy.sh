@@ -74,6 +74,8 @@ fi
 
 log "starting $inactive_name with $IMAGE on 127.0.0.1:$inactive_port"
 docker rm -f "$inactive_name" >/dev/null 2>&1 || true
+docker network disconnect -f "$APP_NETWORK" "$inactive_name" >/dev/null 2>&1 || true
+docker network disconnect -f "$SHARED_NETWORK" "$inactive_name" >/dev/null 2>&1 || true
 docker run -d \
   --name "$inactive_name" \
   --restart unless-stopped \
@@ -88,7 +90,7 @@ docker run -d \
   --health-retries=3 \
   --health-start-period=30s \
   "$IMAGE" >/dev/null
-docker network connect "$SHARED_NETWORK" "$inactive_name"
+docker network connect --alias sub2api "$SHARED_NETWORK" "$inactive_name"
 
 deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
 status=starting
@@ -110,8 +112,6 @@ if docker inspect "$active_name" >/dev/null 2>&1; then
   docker network disconnect "$SHARED_NETWORK" "$active_name" >/dev/null 2>&1 || true
   docker network connect "$SHARED_NETWORK" "$active_name"
 fi
-docker network connect --alias sub2api "$SHARED_NETWORK" "$inactive_name"
-
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 if [[ -f "$NGINX_CONF" ]]; then
   cp "$NGINX_CONF" "$NGINX_CONF.bak.$timestamp"
