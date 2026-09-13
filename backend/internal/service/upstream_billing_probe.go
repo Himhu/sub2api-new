@@ -697,6 +697,32 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 		return s.persistProbeFailure(ctx, account, intervalMinutes, now, resp.StatusCode, "response_too_large", retryAfter(resp.Header, now))
 	}
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		// New API/One API does not expose the Sub2API convention. It exposes
+		// OpenAI-compatible billing endpoints instead, so try those before
+		// recording the account as unsupported.
+		_ = resp.Body.Close()
+		if data, supported := s.probeNewAPIBilling(ctx, account, apiKey, normalizedBaseURL, proxyURL, profile, tlsProfile); supported {
+			snapshot := &UpstreamBillingProbeSnapshot{
+				Status:        UpstreamBillingProbeStatusOK,
+				Data:          data,
+				ReceivedAt:    probeTimePtr(now),
+				FreshUntil:    probeTimePtr(now.Add(2 * time.Duration(intervalMinutes) * time.Minute)),
+				LastAttemptAt: now,
+				NextProbeAt:   now.Add(nextProbeDelay(intervalMinutes, 0)),
+				HTTPStatus:    http.StatusOK,
+			}
+			var syncRate *float64
+			if upstreamBillingRateSyncEnabled(account) {
+				if value, valid := upstreamBillingProbeSyncRate(data); valid {
+					syncRate = &value
+					snapshot.SyncedRateMultiplier = &value
+				}
+			}
+			if err := s.updateSnapshot(ctx, account, snapshot, syncRate); err != nil {
+				return nil, err
+			}
+			return snapshot, nil
+		}
 		return s.persistProbeFailure(ctx, account, intervalMinutes, now, resp.StatusCode, "unsupported", retryAfter(resp.Header, now))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -795,6 +821,203 @@ func (s *UpstreamBillingProbeService) probeUpstreamUsageBalance(
 		return nil, ""
 	}
 	return parseUpstreamUsageBalance(body)
+}
+
+// probeNewAPIBilling supports New API/One API instances, which expose the
+// account quota through the OpenAI-compatible dashboard billing endpoints and
+// expose group multipliers in /api/pricing. The normal Sub2API endpoint remains
+// preferred, so this path is only used after a 404/405 from
+// /v1/sub2api/billing.
+func (s *UpstreamBillingProbeService) probeNewAPIBilling(
+	ctx context.Context,
+	account *Account,
+	apiKey, normalizedBaseURL, proxyURL string,
+	profile HTTPUpstreamProfile,
+	tlsProfile *tlsfingerprint.Profile,
+) (map[string]any, bool) {
+	get := func(endpoint string) ([]byte, int, bool) {
+		probeCtx, cancel := context.WithTimeout(ctx, upstreamBillingProbeRequestTimeout)
+		defer cancel()
+		endpointURL := buildOpenAIEndpointURL(normalizedBaseURL, endpoint)
+		if strings.HasPrefix(endpoint, "/api/") {
+			endpointURL = buildNewAPIRootEndpointURL(normalizedBaseURL, endpoint)
+		}
+		req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, endpointURL, nil)
+		if err != nil {
+			return nil, 0, false
+		}
+		reqCtx := WithHTTPUpstreamProfile(req.Context(), profile)
+		req = req.WithContext(WithHTTPUpstreamRedirectsDisabled(reqCtx))
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		account.ApplyHeaderOverrides(req.Header)
+		resp, err := s.accountTestService.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, tlsProfile)
+		if err != nil || resp == nil || resp.Body == nil {
+			return nil, 0, false
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(io.LimitReader(resp.Body, upstreamBillingProbeMaxBodyBytes+1))
+		if err != nil || len(body) > upstreamBillingProbeMaxBodyBytes || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, resp.StatusCode, false
+		}
+		return body, resp.StatusCode, true
+	}
+
+	pricingBody, _, ok := get("/api/pricing")
+	if !ok {
+		return nil, false
+	}
+	modelsBody, _, ok := get("/v1/models")
+	if !ok {
+		return nil, false
+	}
+	subscriptionBody, _, ok := get("/v1/dashboard/billing/subscription")
+	if !ok {
+		return nil, false
+	}
+	usageBody, _, ok := get("/v1/dashboard/billing/usage")
+	if !ok {
+		return nil, false
+	}
+
+	data, err := parseNewAPIBillingResponses(pricingBody, modelsBody, subscriptionBody, usageBody, time.Now().UTC(), account)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+func buildNewAPIRootEndpointURL(base, endpoint string) string {
+	parsed, err := url.Parse(strings.TrimSpace(base))
+	if err != nil {
+		return strings.TrimRight(strings.TrimSpace(base), "/") + "/" + strings.TrimLeft(endpoint, "/")
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	for strings.HasSuffix(path, "/v1") {
+		path = strings.TrimSuffix(path, "/v1")
+	}
+	parsed.Path = strings.TrimRight(path, "/") + "/" + strings.TrimLeft(endpoint, "/")
+	parsed.RawPath = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+type newAPIPricingItem struct {
+	ModelName   string   `json:"model_name"`
+	EnableGroup []string `json:"enable_groups"`
+}
+
+type newAPIPricingResponse struct {
+	Data       []newAPIPricingItem `json:"data"`
+	GroupRatio map[string]float64  `json:"group_ratio"`
+}
+
+type newAPIModelsResponse struct {
+	Data []struct {
+		ID string `json:"id"`
+	} `json:"data"`
+}
+
+type newAPISubscriptionResponse struct {
+	HardLimitUSD *float64 `json:"hard_limit_usd"`
+}
+
+type newAPIUsageResponse struct {
+	TotalUsage *float64 `json:"total_usage"`
+}
+
+func parseNewAPIBillingResponses(pricingBody, modelsBody, subscriptionBody, usageBody []byte, observedAt time.Time, account *Account) (map[string]any, error) {
+	var pricing newAPIPricingResponse
+	if err := json.Unmarshal(pricingBody, &pricing); err != nil || len(pricing.GroupRatio) == 0 {
+		return nil, fmt.Errorf("invalid New API pricing response")
+	}
+	var models newAPIModelsResponse
+	if err := json.Unmarshal(modelsBody, &models); err != nil || len(models.Data) == 0 {
+		return nil, fmt.Errorf("invalid New API models response")
+	}
+	var subscription newAPISubscriptionResponse
+	if err := json.Unmarshal(subscriptionBody, &subscription); err != nil || subscription.HardLimitUSD == nil {
+		return nil, fmt.Errorf("invalid New API subscription response")
+	}
+	var usage newAPIUsageResponse
+	if err := json.Unmarshal(usageBody, &usage); err != nil || usage.TotalUsage == nil {
+		return nil, fmt.Errorf("invalid New API usage response")
+	}
+	if *subscription.HardLimitUSD < 0 || *usage.TotalUsage < 0 ||
+		math.IsNaN(*subscription.HardLimitUSD) || math.IsInf(*subscription.HardLimitUSD, 0) ||
+		math.IsNaN(*usage.TotalUsage) || math.IsInf(*usage.TotalUsage, 0) {
+		return nil, fmt.Errorf("invalid New API billing values")
+	}
+	balance := *subscription.HardLimitUSD - *usage.TotalUsage/100
+	if balance < 0 || math.IsNaN(balance) || math.IsInf(balance, 0) {
+		return nil, fmt.Errorf("invalid New API wallet balance")
+	}
+
+	data := map[string]any{
+		"object":            "newapi.billing",
+		"schema_version":    1,
+		"billing_scope":     "token",
+		"balance":           balance,
+		"balance_currency":  "USD",
+		"peak_rate_enabled": false,
+		"observed_at":       observedAt.UTC().Format(time.RFC3339Nano),
+		"billing_source":    "newapi_dashboard",
+	}
+	if group, multiplier, ok := resolveNewAPIGroupRatio(pricing, models, account); ok {
+		data["billing_group"] = group
+		data["group_rate_multiplier"] = multiplier
+		data["resolved_rate_multiplier"] = multiplier
+		data["effective_rate_multiplier"] = multiplier
+	}
+	return data, nil
+}
+
+func resolveNewAPIGroupRatio(pricing newAPIPricingResponse, models newAPIModelsResponse, account *Account) (string, float64, bool) {
+	// An explicit credential wins when an operator has configured a key for an
+	// auto/multi-group token. This is intentionally optional and needs no schema
+	// migration.
+	if account != nil {
+		if group := strings.TrimSpace(account.GetCredential("newapi_group")); group != "" {
+			if value, ok := pricing.GroupRatio[group]; ok && value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
+				return group, value, true
+			}
+		}
+	}
+
+	// New API's public pricing response does not include the token's group ID.
+	// For provider-named groups (DeepSeek, Kimi, Gemini, etc.), match the group
+	// name against the model names advertised by the same upstream. This avoids
+	// confusing model_ratio (per-model pricing) with group_ratio (the account
+	// multiplier). A single best match is required; ambiguous mappings leave the
+	// existing account multiplier untouched.
+	scores := make(map[string]int)
+	for _, available := range models.Data {
+		model := strings.ToLower(available.ID)
+		for group := range pricing.GroupRatio {
+			name := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(group, " ", ""), "-", ""))
+			compactModel := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(model, " ", ""), "-", ""))
+			if name != "" && strings.Contains(compactModel, name) {
+				scores[group] += 10
+			}
+		}
+	}
+	bestGroup := ""
+	bestScore := 0
+	for group, score := range scores {
+		if score > bestScore {
+			bestGroup, bestScore = group, score
+		} else if score == bestScore && score > 0 {
+			bestGroup = ""
+		}
+	}
+	if bestGroup == "" {
+		return "", 0, false
+	}
+	value, ok := pricing.GroupRatio[bestGroup]
+	if !ok || value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return "", 0, false
+	}
+	return bestGroup, value, true
 }
 
 func parseUpstreamUsageBalance(body []byte) (*float64, string) {

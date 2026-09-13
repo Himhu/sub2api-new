@@ -686,6 +686,66 @@ func TestParseUpstreamUsageBalance(t *testing.T) {
 	}
 }
 
+func TestParseNewAPIBillingResponsesUsesGroupRatioAndDashboardBalance(t *testing.T) {
+	data, err := parseNewAPIBillingResponses(
+		[]byte(`{"group_ratio":{"DeepSeek":0.3,"Gemini":0.6}}`),
+		[]byte(`{"data":[{"id":"deepseek-v4-flash"},{"id":"deepseek-v4-pro"}]}`),
+		[]byte(`{"hard_limit_usd":3256.21462}`),
+		[]byte(`{"total_usage":316968.9456}`),
+		time.Date(2026, time.September, 13, 13, 0, 0, 0, time.UTC),
+		&Account{Credentials: map[string]any{"api_key": "sk-test"}},
+	)
+	require.NoError(t, err)
+	require.Equal(t, "DeepSeek", data["billing_group"])
+	require.Equal(t, 0.3, data["group_rate_multiplier"])
+	require.Equal(t, 0.3, data["resolved_rate_multiplier"])
+	require.Equal(t, 0.3, data["effective_rate_multiplier"])
+	require.InDelta(t, 86.525164, data["balance"], 1e-9)
+	require.Equal(t, "USD", data["balance_currency"])
+}
+
+func TestResolveNewAPIGroupRatioAllowsExplicitGroup(t *testing.T) {
+	pricing := newAPIPricingResponse{GroupRatio: map[string]float64{"DeepSeek": 0.3, "Gemini": 0.6}}
+	models := newAPIModelsResponse{Data: []struct {
+		ID string `json:"id"`
+	}{{ID: "deepseek-v4-flash"}}}
+	group, multiplier, ok := resolveNewAPIGroupRatio(pricing, models, &Account{Credentials: map[string]any{
+		"newapi_group": "Gemini",
+	}})
+	require.True(t, ok)
+	require.Equal(t, "Gemini", group)
+	require.Equal(t, 0.6, multiplier)
+}
+
+func TestUpstreamBillingProbeFallsBackToNewAPI(t *testing.T) {
+	account := &Account{
+		ID: 41, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive,
+		Credentials: map[string]any{"api_key": "sk-test", "base_url": "https://newapi.example"},
+		Extra:       map[string]any{UpstreamBillingProbeEnabledExtraKey: true, UpstreamBillingRateSyncEnabledExtraKey: true},
+	}
+	repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{account.ID: account}}
+	response := func(status int, body string) *http.Response {
+		return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}
+	}
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		response(http.StatusNotFound, `{"error":"missing"}`),
+		response(http.StatusOK, `{"group_ratio":{"DeepSeek":0.3,"Gemini":0.6}}`),
+		response(http.StatusOK, `{"data":[{"id":"deepseek-v4-flash"},{"id":"deepseek-v4-pro"}]}`),
+		response(http.StatusOK, `{"hard_limit_usd":3256.21462}`),
+		response(http.StatusOK, `{"total_usage":316968.9456}`),
+	}}
+	svc := newUpstreamBillingProbeTestService(repo, upstream, &upstreamBillingProbeSettingRepo{})
+	svc.usageBalanceProbeEnabled = true
+	snapshot, err := svc.ProbeAccount(context.Background(), account.ID)
+	require.NoError(t, err)
+	require.Equal(t, UpstreamBillingProbeStatusOK, snapshot.Status)
+	require.Equal(t, 0.3, snapshot.Data["resolved_rate_multiplier"])
+	require.InDelta(t, 86.525164, snapshot.Data["balance"], 1e-9)
+	require.Equal(t, 0.3, *account.RateMultiplier)
+	require.Len(t, upstream.requests, 5)
+	require.Equal(t, "https://newapi.example/api/pricing", upstream.requests[1].URL.String())
+}
+
 func TestUpstreamBillingProbeDiscardsResultWhenIdentityChangesInFlight(t *testing.T) {
 	account := &Account{
 		ID:          19,
