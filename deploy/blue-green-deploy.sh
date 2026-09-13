@@ -102,6 +102,16 @@ while (( SECONDS < deadline )); do
 done
 [[ "$status" == healthy || "$status" == running ]] || die "$inactive_name did not become healthy (last status: $status)"
 
+# Keep the hostname used by newAPI stable. Only the instance about to receive
+# traffic owns the `sub2api` alias on the shared network. There is a very short
+# DNS handoff while the old endpoint is detached; existing connections remain
+# open and Nginx is switched only after the new endpoint is ready.
+if docker inspect "$active_name" >/dev/null 2>&1; then
+  docker network disconnect "$SHARED_NETWORK" "$active_name" >/dev/null 2>&1 || true
+  docker network connect "$SHARED_NETWORK" "$active_name"
+fi
+docker network connect --alias sub2api "$SHARED_NETWORK" "$inactive_name"
+
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 if [[ -f "$NGINX_CONF" ]]; then
   cp "$NGINX_CONF" "$NGINX_CONF.bak.$timestamp"

@@ -5,6 +5,7 @@ set -Eeuo pipefail
 BASE_DIR=${BASE_DIR:-/opt/sub2api}
 STATE_FILE=${STATE_FILE:-$BASE_DIR/active-color}
 UPSTREAM_CONF=${UPSTREAM_CONF:-/etc/nginx/conf.d/sub2api-upstream.conf}
+SHARED_NETWORK=${SHARED_NETWORK:-new-api_new-api-network}
 
 [[ -f "$STATE_FILE" ]] || { echo "missing active color state: $STATE_FILE" >&2; exit 1; }
 active=$(tr -d '[:space:]' < "$STATE_FILE")
@@ -14,6 +15,11 @@ target_name="sub2api-$target"
 
 status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$target_name" 2>/dev/null || true)
 [[ "$status" == healthy || "$status" == running ]] || { echo "$target_name is not healthy ($status)" >&2; exit 1; }
+
+# Move the stable hostname used by newAPI to the rollback target.
+docker network disconnect "$SHARED_NETWORK" "sub2api-$active" >/dev/null 2>&1 || true
+docker network disconnect "$SHARED_NETWORK" "$target_name" >/dev/null 2>&1 || true
+docker network connect --alias sub2api "$SHARED_NETWORK" "$target_name"
 
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 cp /etc/nginx/conf.d/sub2api.conf "/etc/nginx/conf.d/sub2api.conf.bak.rollback.$timestamp"
